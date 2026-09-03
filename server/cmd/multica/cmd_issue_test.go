@@ -2930,6 +2930,7 @@ func newIssueListTestCmd() *cobra.Command {
 	cmd.Flags().String("sort", "", "")
 	cmd.Flags().String("direction", "", "")
 	cmd.Flags().String("fields", "", "")
+	cmd.Flags().Bool("resolve-properties", false, "")
 	return cmd
 }
 

@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -668,30 +669,98 @@ func buildIssuePropertyRows(properties []propertyDTO, bag map[string]any, actorN
 }
 
 // fetchActorPropertyNames builds a "member:<uuid>" → display name map, but
-// only when the bag actually holds an actor value: every other property type
+// only when some bag actually holds an actor value: every other property type
 // renders without a second round trip, and `issue property list` shouldn't pay
 // for a request it doesn't need.
-func fetchActorPropertyNames(ctx context.Context, client *cli.APIClient, properties []propertyDTO, bag map[string]any) map[string]string {
+func fetchActorPropertyNames(ctx context.Context, client *cli.APIClient, properties []propertyDTO, bags ...map[string]any) (map[string]string, error) {
 	needed := false
 	for _, p := range properties {
-		if _, present := bag[p.ID]; present && (p.Type == "actor" || p.Type == "multi_actor") {
-			needed = true
-			break
+		if p.Type != "actor" && p.Type != "multi_actor" {
+			continue
 		}
-	}
-	if !needed || client.WorkspaceID == "" {
-		return nil
-	}
-	names := make(map[string]string)
-	var members []map[string]any
-	if err := getAssigneeJSON(ctx, client, "/api/workspaces/"+client.WorkspaceID+"/members", &members); err == nil {
-		for _, m := range members {
-			if id := strVal(m, "user_id"); id != "" {
-				names["member:"+id] = strVal(m, "name")
+		for _, bag := range bags {
+			if _, present := bag[p.ID]; present {
+				needed = true
 			}
 		}
 	}
-	return names
+	if !needed || client.WorkspaceID == "" {
+		return nil, nil
+	}
+	var members []map[string]any
+	if err := getAssigneeJSON(ctx, client, "/api/workspaces/"+client.WorkspaceID+"/members", &members); err != nil {
+		return nil, fmt.Errorf("list members: %w", err)
+	}
+	names := make(map[string]string, len(members))
+	for _, m := range members {
+		if id := strVal(m, "user_id"); id != "" {
+			names["member:"+id] = strVal(m, "name")
+		}
+	}
+	return names, nil
+}
+
+const resolvePropertiesHelp = "JSON output only: replace the properties id map with the rows `issue property list` prints (property name and type, option and member names beside the stored ids). Omit for the raw map. No effect on --output table."
+
+// resolveIssueProperties rewrites each issue's properties bag in place into
+// the rows issue property list prints. A nil catalog is fetched on demand,
+// after the page and only when some bag holds a value, so a server without
+// the endpoint still serves pages with nothing to resolve. A bag key with no
+// definition is an error rather than a dropped value: --property and --sort
+// fetch the catalog before the page, so a definition can be newer than it.
+func resolveIssueProperties(ctx context.Context, client *cli.APIClient, catalog []propertyDTO, issues []any) error {
+	type target struct {
+		issue map[string]any
+		bag   map[string]any
+	}
+	var targets []target
+	var bags []map[string]any
+	for _, raw := range issues {
+		issue, ok := raw.(map[string]any)
+		if !ok {
+			return fmt.Errorf("resolve properties: issue is %T, expected an object", raw)
+		}
+		value, present := issue["properties"]
+		if !present {
+			continue
+		}
+		bag, ok := value.(map[string]any)
+		if !ok {
+			return fmt.Errorf("resolve properties: %s: properties is %T, expected an object", issueDisplayKey(issue), value)
+		}
+		targets = append(targets, target{issue: issue, bag: bag})
+		if len(bag) > 0 {
+			bags = append(bags, bag)
+		}
+	}
+	if len(bags) > 0 && catalog == nil {
+		var err error
+		if catalog, err = fetchProperties(ctx, client); err != nil {
+			return err
+		}
+	}
+	actorNames, err := fetchActorPropertyNames(ctx, client, catalog, bags...)
+	if err != nil {
+		return err
+	}
+	known := make(map[string]bool, len(catalog))
+	for _, p := range catalog {
+		known[p.ID] = true
+	}
+	for _, t := range targets {
+		var unknown []string
+		for id := range t.bag {
+			if !known[id] {
+				unknown = append(unknown, id)
+			}
+		}
+		if len(unknown) > 0 {
+			sort.Strings(unknown)
+			return fmt.Errorf("resolve properties: %s has values for property definitions missing from the catalog (%s); re-run to fetch a current catalog", issueDisplayKey(t.issue), strings.Join(unknown, ", "))
+		}
+		t.issue["properties"] = buildIssuePropertyRows(catalog, t.bag, actorNames)
+	}
+	return nil
 }
 
 func fetchIssuePropertyBag(ctx context.Context, client *cli.APIClient, issueID string) (map[string]any, error) {
@@ -736,7 +805,9 @@ func runIssuePropertyList(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	rows := buildIssuePropertyRows(properties, bag, fetchActorPropertyNames(ctx, client, properties, bag))
+	// A failed member lookup leaves display on the raw reference.
+	actorNames, _ := fetchActorPropertyNames(ctx, client, properties, bag)
+	rows := buildIssuePropertyRows(properties, bag, actorNames)
 	output, _ := cmd.Flags().GetString("output")
 	if output == "json" {
 		return cli.PrintJSON(os.Stdout, rows)
@@ -786,7 +857,9 @@ func runIssuePropertySet(cmd *cobra.Command, args []string) error {
 	if err := client.PutJSON(ctx, path, map[string]any{"value": value}, &result); err != nil {
 		return fmt.Errorf("set property: %w", err)
 	}
-	rows := buildIssuePropertyRows(properties, result.Properties, fetchActorPropertyNames(ctx, client, properties, result.Properties))
+	// The value is already written; a failed member lookup must not fail the command.
+	actorNames, _ := fetchActorPropertyNames(ctx, client, properties, result.Properties)
+	rows := buildIssuePropertyRows(properties, result.Properties, actorNames)
 	output, _ := cmd.Flags().GetString("output")
 	if output == "json" {
 		return cli.PrintJSON(os.Stdout, rows)
