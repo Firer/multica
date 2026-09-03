@@ -499,9 +499,11 @@ func init() {
 	issueListCmd.Flags().Int("offset", 0, "Number of issues to skip (for pagination)")
 	issueListCmd.Flags().String("sort", "", "Sort column: position (default, manual board order), title, created_at, start_date, due_date, priority, or property:<name-or-id> to sort by a custom property (select properties sort by option order)")
 	issueListCmd.Flags().String("direction", "", "Sort direction (asc or desc); requires --sort to be a non-position column or a property sort (position is always ascending)")
+	issueListCmd.Flags().Bool("resolve-properties", false, resolvePropertiesHelp)
 
 	// issue get
 	issueGetCmd.Flags().String("output", "json", "Output format: table or json")
+	issueGetCmd.Flags().Bool("resolve-properties", false, resolvePropertiesHelp)
 
 	// issue pull-requests
 	issuePullRequestsCmd.Flags().String("output", "table", "Output format: table or json")
@@ -747,6 +749,11 @@ func runIssueList(cmd *cobra.Command, _ []string) error {
 
 	output, _ := cmd.Flags().GetString("output")
 	if output == "json" {
+		if resolve, _ := cmd.Flags().GetBool("resolve-properties"); resolve {
+			if err := resolveIssueProperties(ctx, client, properties, issuesRaw); err != nil {
+				return err
+			}
+		}
 		total, _ := result["total"].(float64)
 		limit, _ := cmd.Flags().GetInt("limit")
 		offset, _ := cmd.Flags().GetInt("offset")
@@ -917,6 +924,11 @@ func runIssueGet(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	if resolve, _ := cmd.Flags().GetBool("resolve-properties"); resolve {
+		if err := resolveIssueProperties(ctx, client, nil, []any{issue}); err != nil {
+			return err
+		}
+	}
 	return cli.PrintJSON(os.Stdout, issue)
 }
 
