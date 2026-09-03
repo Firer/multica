@@ -559,53 +559,68 @@ func encodeIssuePropertyValue(ctx context.Context, client *cli.APIClient, proper
 	}
 }
 
+// propertyOptionName maps a stored option id to its name, or returns the id
+// when the option is no longer in the definition (the server sorts such a
+// value as NULL rather than failing; display does the same).
+func propertyOptionName(property propertyDTO, id string) string {
+	for _, opt := range property.Config.Options {
+		if opt.ID == id {
+			return opt.Name
+		}
+	}
+	return id
+}
+
+func actorPropertyName(actorNames map[string]string, ref string) string {
+	if name, ok := actorNames[ref]; ok {
+		return name
+	}
+	return ref
+}
+
+// issuePropertyDisplayValues resolves each item of a multi_select or
+// multi_actor value to its display name. The result stays index-parallel
+// with the stored array (a non-string item renders as JSON rather than being
+// dropped) and is nil for every other type or a non-array value.
+func issuePropertyDisplayValues(property propertyDTO, value any, actorNames map[string]string) []string {
+	if property.Type != "multi_select" && property.Type != "multi_actor" {
+		return nil
+	}
+	items, ok := value.([]any)
+	if !ok {
+		return nil
+	}
+	names := make([]string, 0, len(items))
+	for _, item := range items {
+		s, ok := item.(string)
+		switch {
+		case !ok:
+			names = append(names, formatMetadataValue(item))
+		case property.Type == "multi_select":
+			names = append(names, propertyOptionName(property, s))
+		default:
+			names = append(names, actorPropertyName(actorNames, s))
+		}
+	}
+	return names
+}
+
 // formatIssuePropertyValue renders a stored value for humans: option ids
 // become option names, actor references become member names, everything
 // else prints via formatMetadataValue. actorNames may be nil — references then
 // print in their raw "<kind>:<uuid>" form rather than failing.
 func formatIssuePropertyValue(property propertyDTO, value any, actorNames map[string]string) string {
-	optionName := func(id string) string {
-		for _, opt := range property.Config.Options {
-			if opt.ID == id {
-				return opt.Name
-			}
-		}
-		return id
-	}
-	actorName := func(ref string) string {
-		if name, ok := actorNames[ref]; ok {
-			return name
-		}
-		return ref
+	if names := issuePropertyDisplayValues(property, value, actorNames); names != nil {
+		return strings.Join(names, ", ")
 	}
 	switch property.Type {
 	case "select":
 		if s, ok := value.(string); ok {
-			return optionName(s)
-		}
-	case "multi_select":
-		if items, ok := value.([]any); ok {
-			names := make([]string, 0, len(items))
-			for _, item := range items {
-				if s, ok := item.(string); ok {
-					names = append(names, optionName(s))
-				}
-			}
-			return strings.Join(names, ", ")
+			return propertyOptionName(property, s)
 		}
 	case "actor":
 		if s, ok := value.(string); ok {
-			return actorName(s)
-		}
-	case "multi_actor":
-		if items, ok := value.([]any); ok {
-			names := make([]string, 0, len(items))
-			for _, item := range items {
-				if s, ok := item.(string); ok {
-					names = append(names, actorName(s))
-				}
-			}
-			return strings.Join(names, ", ")
+			return actorPropertyName(actorNames, s)
 		}
 	case "checkbox":
 		if b, ok := value.(bool); ok {
@@ -618,13 +633,18 @@ func formatIssuePropertyValue(property propertyDTO, value any, actorNames map[st
 	return formatMetadataValue(value)
 }
 
+// issuePropertyValueRow is one set property on an issue. display is the
+// human rendering; display_values carries the per-item names of a
+// multi_select or multi_actor value, since a joined string is ambiguous
+// once an option name contains a comma.
 type issuePropertyValueRow struct {
-	PropertyID string `json:"property_id"`
-	Name       string `json:"name"`
-	Type       string `json:"type"`
-	Value      any    `json:"value"`
-	Display    string `json:"display"`
-	Archived   bool   `json:"archived,omitempty"`
+	PropertyID    string   `json:"property_id"`
+	Name          string   `json:"name"`
+	Type          string   `json:"type"`
+	Value         any      `json:"value"`
+	Display       string   `json:"display"`
+	DisplayValues []string `json:"display_values,omitempty"`
+	Archived      bool     `json:"archived,omitempty"`
 }
 
 func buildIssuePropertyRows(properties []propertyDTO, bag map[string]any, actorNames map[string]string) []issuePropertyValueRow {
@@ -635,12 +655,13 @@ func buildIssuePropertyRows(properties []propertyDTO, bag map[string]any, actorN
 			continue
 		}
 		rows = append(rows, issuePropertyValueRow{
-			PropertyID: p.ID,
-			Name:       p.Name,
-			Type:       p.Type,
-			Value:      value,
-			Display:    formatIssuePropertyValue(p, value, actorNames),
-			Archived:   p.Archived,
+			PropertyID:    p.ID,
+			Name:          p.Name,
+			Type:          p.Type,
+			Value:         value,
+			Display:       formatIssuePropertyValue(p, value, actorNames),
+			DisplayValues: issuePropertyDisplayValues(p, value, actorNames),
+			Archived:      p.Archived,
 		})
 	}
 	return rows
