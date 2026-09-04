@@ -107,6 +107,12 @@ func newResolveTestServer(t *testing.T, page ...map[string]any) *resolveTestServ
 			_ = json.NewEncoder(w).Encode(map[string]any{"id": "issue-1", "identifier": "MUL-1"})
 		case "/api/issues/issue-1":
 			_ = json.NewEncoder(w).Encode(s.page[0])
+		case "/api/issues/issue-1/properties/" + testReviewerDefID:
+			var body struct {
+				Value any `json:"value"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			_ = json.NewEncoder(w).Encode(map[string]any{"properties": map[string]any{testReviewerDefID: body.Value}})
 		case "/api/workspaces/ws-1/members":
 			s.membersCalls++
 			if s.membersStatus != 0 {
@@ -383,6 +389,47 @@ func TestRunIssueListResolvePropertiesOneMembersRequestPerPage(t *testing.T) {
 	}
 	if srv.membersCalls != 0 {
 		t.Errorf("members calls = %d, want none without an actor value", srv.membersCalls)
+	}
+}
+
+// An actor --property turns a member name into an id and --resolve-properties
+// turns ids back into names. Both read the member list, and the command
+// fetches it once however many actor filters it carries.
+func TestRunIssueListActorFilterSharesMembersRequest(t *testing.T) {
+	srv := newResolveTestServer(t, testIssue("issue-1", "MUL-1", map[string]any{
+		testReviewerDefID: "member:" + testMemberAdaID,
+		testOwnersDefID:   []any{"member:" + testMemberAdaID},
+	}))
+	cmd := newIssueListTestCmd()
+	_ = cmd.Flags().Set("output", "json")
+	_ = cmd.Flags().Set("resolve-properties", "true")
+	for _, flag := range []string{"Reviewer=Ada", "Owners=Ada"} {
+		_ = cmd.Flags().Set("property", flag)
+	}
+	out, err := captureStdout(t, func() error { return runIssueList(cmd, nil) })
+	if err != nil {
+		t.Fatalf("runIssueList: %v", err)
+	}
+	if srv.membersCalls != 1 {
+		t.Errorf("members calls = %d, want one shared by the filter and the resolution", srv.membersCalls)
+	}
+	want := map[string][]string{
+		testReviewerDefID: {"member:" + testMemberAdaID},
+		testOwnersDefID:   {"member:" + testMemberAdaID},
+	}
+	if got := decodePropertiesParam(t, srv.issueQueries); !reflect.DeepEqual(got, want) {
+		t.Errorf("filter sent = %v, want %v", got, want)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal([]byte(out), &resp); err != nil {
+		t.Fatalf("unmarshal output: %v\n%s", err, out)
+	}
+	rows := jsonValue(t, []issuePropertyValueRow{
+		{PropertyID: testReviewerDefID, Name: "Reviewer", Type: "actor", Value: "member:" + testMemberAdaID, Display: "Ada"},
+		{PropertyID: testOwnersDefID, Name: "Owners", Type: "multi_actor", Value: []any{"member:" + testMemberAdaID}, Display: "Ada", DisplayValues: []string{"Ada"}},
+	})
+	if got := issuesOf(t, resp)[0]["properties"]; !reflect.DeepEqual(got, rows) {
+		t.Errorf("resolved rows differ\n got: %#v\nwant: %#v", got, rows)
 	}
 }
 

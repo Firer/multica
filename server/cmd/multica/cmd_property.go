@@ -445,11 +445,34 @@ func makePropertyArchiveRun(archive bool) func(*cobra.Command, []string) error {
 // issue property {list|set|unset}
 // ---------------------------------------------------------------------------
 
+// memberDirectory serves every member lookup in one command from a single
+// request. An actor --property filter, an actor --value and
+// --resolve-properties all read the list, and each used to fetch its own.
+type memberDirectory struct {
+	members []map[string]any
+	loaded  bool
+}
+
+func (d *memberDirectory) load(ctx context.Context, client *cli.APIClient) ([]map[string]any, error) {
+	if d.loaded {
+		return d.members, nil
+	}
+	if client.WorkspaceID == "" {
+		return nil, fmt.Errorf("workspace ID is required to resolve members; use --workspace-id or set MULTICA_WORKSPACE_ID")
+	}
+	var members []map[string]any
+	if err := getAssigneeJSON(ctx, client, "/api/workspaces/"+client.WorkspaceID+"/members", &members); err != nil {
+		return nil, fmt.Errorf("list members: %w", err)
+	}
+	d.members, d.loaded = members, true
+	return members, nil
+}
+
 // resolveActorPropertyRef turns one --value token into a "member:<uuid>"
 // actor reference. An already-prefixed token is taken as-is (after checking
-// the id parses); anything else goes through the same member lookup
-// `--assignee` uses, so names, emails, UUIDs and short ids all work.
-func resolveActorPropertyRef(ctx context.Context, client *cli.APIClient, raw string) (string, error) {
+// the id parses); anything else is matched the way `--assignee` matches
+// members, so names, emails, UUIDs and short ids all work.
+func resolveActorPropertyRef(ctx context.Context, client *cli.APIClient, directory *memberDirectory, raw string) (string, error) {
 	token := strings.TrimSpace(raw)
 	if token == "" {
 		return "", fmt.Errorf("actor value cannot be empty")
@@ -465,7 +488,11 @@ func resolveActorPropertyRef(ctx context.Context, client *cli.APIClient, raw str
 		// store fine via `property set` but silently miss as a filter.
 		return kind + ":" + parsed.String(), nil
 	}
-	actorType, actorID, err := resolveAssignee(ctx, client, token, memberOnlyKinds)
+	members, err := directory.load(ctx, client)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve assignee: %w", err)
+	}
+	actorType, actorID, err := matchAssignee(token, memberOnlyKinds, memberCandidates(members))
 	if err != nil {
 		return "", err
 	}
@@ -492,7 +519,7 @@ func resolveSelectOptionRef(property propertyDTO, ref string) (string, error) {
 // encodeIssuePropertyValue converts the CLI --value string into the typed
 // JSON the API expects, translating option names to ids for select types and
 // member names to actor references for actor types.
-func encodeIssuePropertyValue(ctx context.Context, client *cli.APIClient, property propertyDTO, raw string) (json.RawMessage, error) {
+func encodeIssuePropertyValue(ctx context.Context, client *cli.APIClient, directory *memberDirectory, property propertyDTO, raw string) (json.RawMessage, error) {
 	optionNames := make([]string, len(property.Config.Options))
 	for i, opt := range property.Config.Options {
 		optionNames[i] = opt.Name
@@ -523,7 +550,7 @@ func encodeIssuePropertyValue(ctx context.Context, client *cli.APIClient, proper
 		}
 		return json.Marshal(ids)
 	case "actor":
-		ref, err := resolveActorPropertyRef(ctx, client, raw)
+		ref, err := resolveActorPropertyRef(ctx, client, directory, raw)
 		if err != nil {
 			return nil, err
 		}
@@ -535,7 +562,7 @@ func encodeIssuePropertyValue(ctx context.Context, client *cli.APIClient, proper
 			if strings.TrimSpace(part) == "" {
 				continue
 			}
-			ref, err := resolveActorPropertyRef(ctx, client, part)
+			ref, err := resolveActorPropertyRef(ctx, client, directory, part)
 			if err != nil {
 				return nil, err
 			}
@@ -672,7 +699,7 @@ func buildIssuePropertyRows(properties []propertyDTO, bag map[string]any, actorN
 // only when some bag actually holds an actor value: every other property type
 // renders without a second round trip, and `issue property list` shouldn't pay
 // for a request it doesn't need.
-func fetchActorPropertyNames(ctx context.Context, client *cli.APIClient, properties []propertyDTO, bags ...map[string]any) (map[string]string, error) {
+func fetchActorPropertyNames(ctx context.Context, client *cli.APIClient, directory *memberDirectory, properties []propertyDTO, bags ...map[string]any) (map[string]string, error) {
 	needed := false
 	for _, p := range properties {
 		if p.Type != "actor" && p.Type != "multi_actor" {
@@ -687,9 +714,9 @@ func fetchActorPropertyNames(ctx context.Context, client *cli.APIClient, propert
 	if !needed || client.WorkspaceID == "" {
 		return nil, nil
 	}
-	var members []map[string]any
-	if err := getAssigneeJSON(ctx, client, "/api/workspaces/"+client.WorkspaceID+"/members", &members); err != nil {
-		return nil, fmt.Errorf("list members: %w", err)
+	members, err := directory.load(ctx, client)
+	if err != nil {
+		return nil, err
 	}
 	names := make(map[string]string, len(members))
 	for _, m := range members {
@@ -708,7 +735,7 @@ const resolvePropertiesHelp = "JSON output only: replace the properties id map w
 // the endpoint still serves pages with nothing to resolve. A bag key with no
 // definition is an error rather than a dropped value: --property and --sort
 // fetch the catalog before the page, so a definition can be newer than it.
-func resolveIssueProperties(ctx context.Context, client *cli.APIClient, catalog []propertyDTO, issues []any) error {
+func resolveIssueProperties(ctx context.Context, client *cli.APIClient, catalog []propertyDTO, directory *memberDirectory, issues []any) error {
 	type target struct {
 		issue map[string]any
 		bag   map[string]any
@@ -739,7 +766,7 @@ func resolveIssueProperties(ctx context.Context, client *cli.APIClient, catalog 
 			return err
 		}
 	}
-	actorNames, err := fetchActorPropertyNames(ctx, client, catalog, bags...)
+	actorNames, err := fetchActorPropertyNames(ctx, client, directory, catalog, bags...)
 	if err != nil {
 		return err
 	}
@@ -806,7 +833,7 @@ func runIssuePropertyList(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	// A failed member lookup leaves display on the raw reference.
-	actorNames, _ := fetchActorPropertyNames(ctx, client, properties, bag)
+	actorNames, _ := fetchActorPropertyNames(ctx, client, &memberDirectory{}, properties, bag)
 	rows := buildIssuePropertyRows(properties, bag, actorNames)
 	output, _ := cmd.Flags().GetString("output")
 	if output == "json" {
@@ -845,7 +872,8 @@ func runIssuePropertySet(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	value, err := encodeIssuePropertyValue(ctx, client, property, rawValue)
+	var members memberDirectory
+	value, err := encodeIssuePropertyValue(ctx, client, &members, property, rawValue)
 	if err != nil {
 		return err
 	}
@@ -858,7 +886,7 @@ func runIssuePropertySet(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("set property: %w", err)
 	}
 	// The value is already written; a failed member lookup must not fail the command.
-	actorNames, _ := fetchActorPropertyNames(ctx, client, properties, result.Properties)
+	actorNames, _ := fetchActorPropertyNames(ctx, client, &members, properties, result.Properties)
 	rows := buildIssuePropertyRows(properties, result.Properties, actorNames)
 	output, _ := cmd.Flags().GetString("output")
 	if output == "json" {
@@ -937,7 +965,7 @@ var issueSortablePropertyTypes = []string{"select", "number", "date", "text", "u
 // property ORs its values (server semantics: OR within a definition, AND
 // across definitions), keyed by the RESOLVED definition id so name and UUID
 // addressing aggregate into one entry.
-func buildPropertiesFilterQueryParam(ctx context.Context, client *cli.APIClient, properties []propertyDTO, pairs []string) (string, error) {
+func buildPropertiesFilterQueryParam(ctx context.Context, client *cli.APIClient, directory *memberDirectory, properties []propertyDTO, pairs []string) (string, error) {
 	filter := make(map[string][]string, len(pairs))
 	for _, pair := range pairs {
 		name, rawValue, found := strings.Cut(pair, "=")
@@ -959,7 +987,7 @@ func buildPropertiesFilterQueryParam(ctx context.Context, client *cli.APIClient,
 		if property.Archived {
 			return "", fmt.Errorf("property %q is archived; archived properties are hidden from filtering (matching the web UI) — restore it with `multica property unarchive` if you need it", property.Name)
 		}
-		value, err := resolvePropertyFilterValue(ctx, client, property, rawValue)
+		value, err := resolvePropertyFilterValue(ctx, client, directory, property, rawValue)
 		if err != nil {
 			return "", err
 		}
@@ -992,7 +1020,7 @@ func buildPropertiesFilterQueryParam(ctx context.Context, client *cli.APIClient,
 // and url length; the branches below follow it. A value that could never
 // match is rejected here rather than sent, because an empty result reads
 // like a real answer.
-func resolvePropertyFilterValue(ctx context.Context, client *cli.APIClient, property propertyDTO, raw string) (string, error) {
+func resolvePropertyFilterValue(ctx context.Context, client *cli.APIClient, directory *memberDirectory, property propertyDTO, raw string) (string, error) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == propertyNoValueSentinel {
 		return propertyNoValueSentinel, nil
@@ -1006,7 +1034,7 @@ func resolvePropertyFilterValue(ctx context.Context, client *cli.APIClient, prop
 		}
 		return trimmed, nil
 	case "actor", "multi_actor":
-		return resolveActorPropertyRef(ctx, client, trimmed)
+		return resolveActorPropertyRef(ctx, client, directory, trimmed)
 	case "number":
 		num, err := strconv.ParseFloat(trimmed, 64)
 		if err != nil {
