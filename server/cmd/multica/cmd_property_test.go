@@ -1,8 +1,11 @@
 package main
 
 import (
+	"encoding/json"
 	"reflect"
 	"testing"
+
+	"github.com/spf13/cobra"
 )
 
 // A joined display string cannot be split back into option names once an
@@ -63,5 +66,32 @@ func TestFormatIssuePropertyValueMultiValueNotArray(t *testing.T) {
 	}
 	if got := issuePropertyDisplayValues(platforms, "not-a-list", nil); got != nil {
 		t.Errorf("display_values = %v, want nil", got)
+	}
+}
+
+// An actor --value becomes an id through the member list, and the rows
+// printed afterwards turn that id back into a name; one command, one request.
+func TestRunIssuePropertySetSharesMembersRequest(t *testing.T) {
+	srv := newResolveTestServer(t, testIssue("issue-1", "MUL-1", nil))
+	cmd := &cobra.Command{Use: "set"}
+	cmd.Flags().String("name", "", "")
+	cmd.Flags().String("value", "", "")
+	cmd.Flags().String("output", "json", "")
+	_ = cmd.Flags().Set("name", "Reviewer")
+	_ = cmd.Flags().Set("value", "Ada")
+	out, err := captureStdout(t, func() error { return runIssuePropertySet(cmd, []string{"MUL-1"}) })
+	if err != nil {
+		t.Fatalf("runIssuePropertySet: %v", err)
+	}
+	if srv.membersCalls != 1 {
+		t.Errorf("members calls = %d, want one shared by the value and the printed rows", srv.membersCalls)
+	}
+	var rows []issuePropertyValueRow
+	if err := json.Unmarshal([]byte(out), &rows); err != nil {
+		t.Fatalf("unmarshal output: %v\n%s", err, out)
+	}
+	want := []issuePropertyValueRow{{PropertyID: testReviewerDefID, Name: "Reviewer", Type: "actor", Value: "member:" + testMemberAdaID, Display: "Ada"}}
+	if !reflect.DeepEqual(rows, want) {
+		t.Errorf("rows = %#v, want %#v", rows, want)
 	}
 }

@@ -1255,7 +1255,7 @@ func TestResolveAssignee(t *testing.T) {
 	})
 
 	t.Run("resolveActorPropertyRef renders a prefixed reference", func(t *testing.T) {
-		ref, err := resolveActorPropertyRef(ctx, client, "alice@example.com")
+		ref, err := resolveActorPropertyRef(ctx, client, &memberDirectory{}, "alice@example.com")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -1265,7 +1265,7 @@ func TestResolveAssignee(t *testing.T) {
 	})
 
 	t.Run("resolveActorPropertyRef rejects a non-member kind", func(t *testing.T) {
-		if _, err := resolveActorPropertyRef(ctx, client, "codebot"); err == nil {
+		if _, err := resolveActorPropertyRef(ctx, client, &memberDirectory{}, "codebot"); err == nil {
 			t.Error("expected an agent name to be unresolvable for an actor property")
 		}
 	})
