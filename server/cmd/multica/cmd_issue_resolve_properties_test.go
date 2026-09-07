@@ -482,3 +482,74 @@ func TestRunIssueGetResolvesProperties(t *testing.T) {
 		t.Errorf("table output must not fetch the catalog (%d)", srv.propertiesCalls)
 	}
 }
+
+// --fields and --resolve-properties both rewrite the same properties key.
+// Keeping properties resolves it exactly as without --fields; dropping it is
+// rejected up front rather than silently ignoring the flag or paying for a
+// catalog and member request whose output is deleted a line later.
+func TestRunIssueListResolvePropertiesWithFields(t *testing.T) {
+	srv := newResolveTestServer(t, testIssue("issue-1", "MUL-1", alphaBag()))
+
+	_, resp, err := runIssueListJSON(t, map[string]string{
+		"fields":             "id,title,properties",
+		"resolve-properties": "true",
+	})
+	if err != nil {
+		t.Fatalf("runIssueList: %v", err)
+	}
+	issue := issuesOf(t, resp)[0]
+	if got, want := issue["properties"], jsonValue(t, alphaRows()); !reflect.DeepEqual(got, want) {
+		t.Errorf("resolved rows differ under --fields\n got: %#v\nwant: %#v", got, want)
+	}
+	if _, present := issue["status"]; present {
+		t.Errorf("--fields did not drop status: %v", issue)
+	}
+	if srv.propertiesCalls != 1 || srv.membersCalls != 1 {
+		t.Errorf("catalog calls = %d, members calls = %d; want one each", srv.propertiesCalls, srv.membersCalls)
+	}
+
+	// properties filtered out: refuse rather than resolve into the void.
+	srv = newResolveTestServer(t, testIssue("issue-1", "MUL-1", alphaBag()))
+	_, _, err = runIssueListJSON(t, map[string]string{
+		"fields":             "id,title",
+		"resolve-properties": "true",
+	})
+	if err == nil || !strings.Contains(err.Error(), "--resolve-properties needs the properties field") {
+		t.Fatalf("err = %v, want the --fields/--resolve-properties conflict", err)
+	}
+	if srv.propertiesCalls != 0 || srv.membersCalls != 0 {
+		t.Errorf("rejected combination still fetched: catalog %d, members %d", srv.propertiesCalls, srv.membersCalls)
+	}
+
+	// Table output ignores both flags, so the guard must not fire there: a
+	// reader who keeps them on the command line and switches back to a table
+	// still gets the table (found in final review of the guard commit).
+	srv = newResolveTestServer(t, testIssue("issue-1", "MUL-1", alphaBag()))
+	tableCmd := newIssueListTestCmd()
+	_ = tableCmd.Flags().Set("output", "table")
+	_ = tableCmd.Flags().Set("fields", "id,title")
+	_ = tableCmd.Flags().Set("resolve-properties", "true")
+	out, err := captureStdout(t, func() error { return runIssueList(tableCmd, nil) })
+	if err != nil {
+		t.Fatalf("table output must ignore both flags, got: %v", err)
+	}
+	if !strings.Contains(out, "MUL-1") {
+		t.Errorf("table output lost its row:\n%s", out)
+	}
+	if srv.propertiesCalls != 0 || srv.membersCalls != 0 {
+		t.Errorf("table output fetched: catalog %d, members %d", srv.propertiesCalls, srv.membersCalls)
+	}
+
+	// --fields alone keeps the raw bag; the guard must not fire without the flag.
+	srv = newResolveTestServer(t, testIssue("issue-1", "MUL-1", alphaBag()))
+	_, resp, err = runIssueListJSON(t, map[string]string{"fields": "id,title"})
+	if err != nil {
+		t.Fatalf("runIssueList without --resolve-properties: %v", err)
+	}
+	if _, present := issuesOf(t, resp)[0]["properties"]; present {
+		t.Errorf("--fields id,title kept properties")
+	}
+	if srv.propertiesCalls != 0 || srv.membersCalls != 0 {
+		t.Errorf("plain --fields fetched: catalog %d, members %d", srv.propertiesCalls, srv.membersCalls)
+	}
+}

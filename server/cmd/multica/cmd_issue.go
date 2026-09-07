@@ -761,12 +761,31 @@ func runIssueList(cmd *cobra.Command, _ []string) error {
 		for _, f := range validIssueFields {
 			valid[f] = true
 		}
+		keepsProperties := false
 		for _, f := range strings.Split(v, ",") {
 			f = strings.TrimSpace(f)
 			if !valid[f] {
 				return fmt.Errorf("invalid --fields value %q; valid values: %s", f, strings.Join(validIssueFields, ", "))
 			}
+			if f == "properties" {
+				keepsProperties = true
+			}
 			fields = append(fields, f)
+		}
+		// --fields without `properties` deletes the very key
+		// --resolve-properties rewrites, so the pair would either cost two
+		// requests for output nobody sees or leave the flag silently doing
+		// nothing. A passed-but-ignored flag is a footgun in scripts (the
+		// same reason --fields rejects "assignee" instead of dropping it),
+		// so say so instead of picking one of those.
+		//
+		// Only in JSON mode, though: both flags document themselves as having
+		// no effect on --output table, so a table reader who leaves them on
+		// the command line must still get their table.
+		outputFormat, _ := cmd.Flags().GetString("output")
+		resolve, _ := cmd.Flags().GetBool("resolve-properties")
+		if outputFormat == "json" && resolve && !keepsProperties {
+			return fmt.Errorf("--resolve-properties needs the properties field, but --fields does not include it; add properties to --fields or drop --resolve-properties")
 		}
 	}
 
@@ -785,7 +804,9 @@ func runIssueList(cmd *cobra.Command, _ []string) error {
 	output, _ := cmd.Flags().GetString("output")
 	if output == "json" {
 		// --fields runs first so a page that drops `properties` never pays for
-		// the catalog request resolving it would need.
+		// the catalog and member requests resolving it would need. Combining
+		// the two with `properties` filtered out is rejected above, so nothing
+		// resolvable is deleted before it is resolved.
 		if len(fields) > 0 {
 			filterIssueFields(issuesRaw, fields)
 		}
